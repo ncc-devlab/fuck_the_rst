@@ -16,16 +16,37 @@ data = 52 53 54 47 55 41 52 44  # ASCII "RSTGUARD"
 
 ## 构建与挂载
 
+Ubuntu 24 需要安装 LLVM/eBPF 编译工具：
+
+```sh
+sudo apt update
+sudo apt install clang llvm libbpf-dev linux-libc-dev iproute2
+```
+
+Makefile 会自动选择 `clang` 或版本化的 `clang-18`、`clang-17` 等命令，并根据当前机器架构选择 x86 或 arm64。
+
 ```sh
 make
-sudo tc qdisc replace dev eth0 clsact
-sudo tc filter replace dev eth0 ingress bpf da obj rst_guard.bpf.o sec classifier
+IFACE=eth0
+sudo tc qdisc replace dev "$IFACE" clsact
+sudo tc filter replace dev "$IFACE" ingress bpf da obj rst_guard.bpf.o sec classifier
 ```
+
+`IFACE` 必须替换为实际网卡名称，可用 `ip -br link` 查看。`bpf` 是 `tc` 的过滤器类型，不是需要单独运行的命令；不能把上面的过滤器命令拆成
+`tc filter replace ... ingress` 和 `bpf da obj ...` 两条命令。前者会报
+`Filter kind and protocol must be specified`，后者会报 `bpf: command not found`。
 
 客户端还要在出口方向挂载同一个对象。它会把本机 TCP 栈生成的、无数据的 IPv4 SSH RST 改写为带 `RSTGUARD` option 的 RST；入口规则则继续丢弃没有魔数的远端 RST：
 
 ```sh
-sudo tc filter replace dev eth0 egress bpf da obj rst_guard.bpf.o sec classifier/egress
+sudo tc filter replace dev "$IFACE" egress bpf da obj rst_guard.bpf.o sec classifier/egress
+```
+
+确认过滤器已经挂载：
+
+```sh
+sudo tc filter show dev "$IFACE" ingress
+sudo tc filter show dev "$IFACE" egress
 ```
 
 出口程序只处理本机生成的 IPv4、无 TCP payload、端口为 22 的 RST。它不会把普通出站数据包改成 RST，也不会阻止本机释放连接。

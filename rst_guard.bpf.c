@@ -90,6 +90,10 @@ static __always_inline int check_tcp(void *data, void *data_end,
 		return TC_ACT_OK;
 	option_len = header_len - sizeof(*tcp);
 	options = (__u8 *)tcp + sizeof(*tcp);
+	/* Keep this check adjacent to the pointer passed to the parser. Older
+	 * verifiers do not infer this range from the complete TCP-header check. */
+	if (options + option_len > (__u8 *)data_end)
+		return TC_ACT_OK;
 	if (option_len && has_guard_option(options, option_len))
 		return TC_ACT_OK;
 
