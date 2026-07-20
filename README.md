@@ -10,9 +10,10 @@
 kind = 254                 # TCP experimental option
 length = 10
 data = 52 53 54 47 55 41 52 44  # ASCII "RSTGUARD"
+pad  = 00 00               # 4-byte alignment after the option
 ```
 
-该 option 必须是 TCP options 中的最后一段。发送端需要在 RST 报文的 TCP 头部增加该 option；普通 RST 不会被接受。
+入口侧检查 TCP options 的**最后 12 字节**是否恰好是该块（`254,10,RSTGUARD,0,0`）。客户端出口程序写入的也是这一块。普通 RST 不会被接受。
 
 ## 构建与挂载
 
@@ -54,11 +55,12 @@ sudo tc filter show dev "$IFACE" egress
 卸载：
 
 ```sh
-sudo tc filter del dev eth0 ingress
-sudo tc qdisc del dev eth0 clsact
+sudo tc filter del dev "$IFACE" ingress
+sudo tc filter del dev "$IFACE" egress
+sudo tc qdisc del dev "$IFACE" clsact
 ```
 
-把 `eth0` 换成实际接收 SSH 流量的网卡。过滤器不会挂到 egress，因此本机内核主动发送的 RST、FIN 或普通 TCP 释放不会被拦截；SSH 没有心跳时，本机仍可正常释放连接。
+把 `IFACE` 换成实际网卡。入口只丢无魔数的 SSH RST；出口改写本机生成的 IPv4 SSH RST。FIN 与普通 TCP 释放不受影响。
 
 ## 限制
 

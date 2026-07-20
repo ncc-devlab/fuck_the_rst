@@ -12,6 +12,7 @@
 #define SSH_PORT 22
 #define TCP_OPT_EXPERIMENTAL 254
 #define RST_GUARD_OPTION_LEN 10
+#define RST_GUARD_BLOCK_LEN 12 /* kind+len+magic+2 zero pad (4-byte aligned) */
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
 #define BPF_HTONS(x) ((__u16)__builtin_bswap16((__u16)(x)))
@@ -21,80 +22,60 @@ struct vlan_header {
 	__u16 encapsulated_proto;
 } __attribute__((packed));
 
-static const __u8 rst_guard_magic[8] = {
-	0x52, 0x53, 0x54, 0x47, 0x55, 0x41, 0x52, 0x44,
-};
-
-static __always_inline int has_guard_option(const __u8 *options, __u32 length)
+/*
+ * Guard is always emitted as the final 12-byte block:
+ *   254, 10, 'R','S','T','G','U','A','R','D', 0, 0
+ * Matching only that trailing block avoids variable-length option walks that
+ * trip the Ubuntu 24 / recent BPF verifiers.
+ */
+static __always_inline int has_guard_option(struct __sk_buff *skb, __u32 opt_off,
+					    __u32 opt_len)
 {
-	__u32 off = 0;
+	__u8 tail[RST_GUARD_BLOCK_LEN];
 
-	/* The option must be the final option, not merely present somewhere. */
-#pragma unroll
-	for (int i = 0; i < 40; i++) {
-		__u8 kind;
-		__u8 option_len;
+	if (opt_len < RST_GUARD_BLOCK_LEN || opt_len > 40)
+		return 0;
+	if (bpf_skb_load_bytes(skb, opt_off + opt_len - RST_GUARD_BLOCK_LEN, tail,
+			       RST_GUARD_BLOCK_LEN))
+		return 0;
 
-		if (off >= length)
-			break;
-		if (off + 1 > length)
-			break;
-
-		kind = options[off];
-		if (kind == 0)
-			return 0; /* EOL is the final option, so guard was absent. */
-		if (kind == 1) {
-			off++;
-			continue;
-		}
-		if (off + 2 > length)
-			break;
-		option_len = options[off + 1];
-		if (option_len < 2 || off + option_len > length)
-			break;
-		if (kind == TCP_OPT_EXPERIMENTAL &&
-			option_len == RST_GUARD_OPTION_LEN) {
-			int matches = 1;
-			/* TCP options are 32-bit aligned; accept only EOL zero padding. */
-			for (int k = off + option_len; k < length; k++)
-				if (options[k] != 0)
-					matches = 0;
-			for (int j = 0; j < 8; j++)
-				if (options[off + 2 + j] != rst_guard_magic[j])
-					matches = 0;
-			return matches;
-		}
-		off += option_len;
-	}
-	return 0;
+	if (tail[0] != TCP_OPT_EXPERIMENTAL || tail[1] != RST_GUARD_OPTION_LEN)
+		return 0;
+	if (tail[2] != 0x52 || tail[3] != 0x53 || tail[4] != 0x54 ||
+	    tail[5] != 0x47 || tail[6] != 0x55 || tail[7] != 0x41 ||
+	    tail[8] != 0x52 || tail[9] != 0x44)
+		return 0;
+	if (tail[10] != 0 || tail[11] != 0)
+		return 0;
+	return 1;
 }
 
-static __always_inline int check_tcp(void *data, void *data_end,
-					     __u32 offset)
+static __always_inline int check_tcp(struct __sk_buff *skb, void *data,
+				     void *data_end, __u32 offset)
 {
-	struct tcphdr *tcp = data + offset;
-		__u32 header_len;
-		__u32 option_len;
-		__u8 *options;
+	struct tcphdr *tcp;
+	__u32 header_len;
+	__u32 option_len;
 
-	if ((void *)(tcp + 1) > data_end)
+	if (data + offset + sizeof(struct tcphdr) > data_end)
 		return TC_ACT_OK;
+	tcp = data + offset;
+
 	if (tcp->source != BPF_HTONS(SSH_PORT) &&
-		tcp->dest != BPF_HTONS(SSH_PORT))
+	    tcp->dest != BPF_HTONS(SSH_PORT))
 		return TC_ACT_OK;
 	if (!tcp->rst)
 		return TC_ACT_OK;
 
 	header_len = (__u32)tcp->doff * 4;
-	if (header_len < sizeof(*tcp) || data + offset + header_len > data_end)
+	if (header_len < sizeof(struct tcphdr) || header_len > 60)
 		return TC_ACT_OK;
-	option_len = header_len - sizeof(*tcp);
-	options = (__u8 *)tcp + sizeof(*tcp);
-	/* Keep this check adjacent to the pointer passed to the parser. Older
-	 * verifiers do not infer this range from the complete TCP-header check. */
-	if (options + option_len > (__u8 *)data_end)
+	if (data + offset + header_len > data_end)
 		return TC_ACT_OK;
-	if (option_len && has_guard_option(options, option_len))
+
+	option_len = header_len - sizeof(struct tcphdr);
+	if (option_len &&
+	    has_guard_option(skb, offset + sizeof(struct tcphdr), option_len))
 		return TC_ACT_OK;
 
 	return TC_ACT_SHOT;
@@ -115,6 +96,7 @@ int rst_guard(struct __sk_buff *skb)
 	if (protocol == BPF_HTONS(ETH_P_8021Q) ||
 	    protocol == BPF_HTONS(ETH_P_8021AD)) {
 		struct vlan_header *vlan = data + offset;
+
 		if ((void *)(vlan + 1) > data_end)
 			return TC_ACT_OK;
 		protocol = vlan->encapsulated_proto;
@@ -124,20 +106,23 @@ int rst_guard(struct __sk_buff *skb)
 	if (protocol == BPF_HTONS(ETH_P_IP)) {
 		struct iphdr *ip = data + offset;
 		__u32 ihl;
+
 		if ((void *)(ip + 1) > data_end)
 			return TC_ACT_OK;
 		ihl = (__u32)ip->ihl * 4;
-		if (ip->protocol != IPPROTO_TCP || ihl < sizeof(*ip) ||
-			data + offset + ihl > data_end)
+		if (ip->protocol != IPPROTO_TCP || ihl < sizeof(*ip) || ihl > 60)
 			return TC_ACT_OK;
-		return check_tcp(data, data_end, offset + ihl);
+		if (data + offset + ihl > data_end)
+			return TC_ACT_OK;
+		return check_tcp(skb, data, data_end, offset + ihl);
 	}
 
 	if (protocol == BPF_HTONS(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6 = data + offset;
+
 		if ((void *)(ip6 + 1) > data_end || ip6->nexthdr != IPPROTO_TCP)
 			return TC_ACT_OK;
-		return check_tcp(data, data_end, offset + sizeof(*ip6));
+		return check_tcp(skb, data, data_end, offset + sizeof(*ip6));
 	}
 
 	return TC_ACT_OK;
@@ -148,6 +133,7 @@ int rst_guard(struct __sk_buff *skb)
  * stack.  For a header-only IPv4 RST, make room at the network header,
  * move the IP/TCP headers back, and use the new room as TCP options.
  */
+/* Keep a legacy section name so `tc ... sec classifier/egress` still works. */
 SEC("classifier/egress")
 int rst_guard_client_egress(struct __sk_buff *skb)
 {
@@ -161,15 +147,15 @@ int rst_guard_client_egress(struct __sk_buff *skb)
 	__u32 tcp_offset;
 	__u32 tcp_len;
 	__u16 old_total;
-	__u16 old_offset_flags;
 	__u16 old_doff_flags;
 	__u16 new_doff_flags;
 	__u16 new_total;
-	__u8 option[12] = {
+	__u8 option[RST_GUARD_BLOCK_LEN] = {
 		TCP_OPT_EXPERIMENTAL, RST_GUARD_OPTION_LEN,
 		0x52, 0x53, 0x54, 0x47, 0x55, 0x41, 0x52, 0x44,
 		0x00, 0x00,
 	};
+	int i;
 
 	if ((void *)(eth + 1) > data_end || eth->h_proto != BPF_HTONS(ETH_P_IP))
 		return TC_ACT_OK;
@@ -177,55 +163,63 @@ int rst_guard_client_egress(struct __sk_buff *skb)
 	if ((void *)(ip + 1) > data_end || ip->protocol != IPPROTO_TCP)
 		return TC_ACT_OK;
 	ihl = (__u32)ip->ihl * 4;
-	if (ihl < sizeof(*ip) || ip_offset + ihl > (__u64)(data_end - data))
+	if (ihl < sizeof(*ip) || ihl > 60)
+		return TC_ACT_OK;
+	if (data + ip_offset + ihl > data_end)
 		return TC_ACT_OK;
 	tcp_offset = ip_offset + ihl;
+	if (data + tcp_offset + sizeof(*tcp) > data_end)
+		return TC_ACT_OK;
 	tcp = data + tcp_offset;
-	if ((void *)(tcp + 1) > data_end ||
-		(tcp->source != BPF_HTONS(SSH_PORT) &&
-		 tcp->dest != BPF_HTONS(SSH_PORT)) || !tcp->rst)
+	if ((tcp->source != BPF_HTONS(SSH_PORT) &&
+	     tcp->dest != BPF_HTONS(SSH_PORT)) ||
+	    !tcp->rst)
 		return TC_ACT_OK;
 	tcp_len = (__u32)tcp->doff * 4;
-	if (tcp_len < sizeof(*tcp) || tcp_len > 48 ||
-		tcp_offset + tcp_len > (__u64)(data_end - data))
+	if (tcp_len < sizeof(*tcp) || tcp_len > 48)
 		return TC_ACT_OK;
-	if (ip->tot_len != BPF_HTONS(ip_offset + ihl + tcp_len - ip_offset))
-		return TC_ACT_OK; /* Do not touch fragmented/GSO-like packets. */
-	if (has_guard_option((__u8 *)tcp + sizeof(*tcp),
-				     tcp_len - sizeof(*tcp)))
+	if (data + tcp_offset + tcp_len > data_end)
+		return TC_ACT_OK;
+	/* Do not touch fragmented/GSO-like packets. */
+	if (ip->tot_len != BPF_HTONS(ihl + tcp_len))
+		return TC_ACT_OK;
+	if (has_guard_option(skb, tcp_offset + sizeof(struct tcphdr),
+			     tcp_len - sizeof(struct tcphdr)))
 		return TC_ACT_OK;
 
 	old_total = ip->tot_len;
-	old_offset_flags = *(__u16 *)((__u8 *)tcp + 12);
-	new_doff_flags = old_offset_flags | BPF_HTONS(3 << 12);
-	old_doff_flags = old_offset_flags;
+	old_doff_flags = *(__u16 *)((__u8 *)tcp + 12);
 	if (bpf_skb_adjust_room(skb, sizeof(option), BPF_ADJ_ROOM_NET,
 				BPF_F_ADJ_ROOM_NO_CSUM_RESET))
 		return TC_ACT_OK;
 
 	/* The helper inserted room before the old IP header; restore headers. */
-	for (int i = 0; i < 60; i++) {
+	for (i = 0; i < 60; i++) {
 		__u8 byte;
+
 		if (i >= ihl)
 			break;
-		if (bpf_skb_load_bytes(skb, ip_offset + sizeof(option) + i,
-					       &byte, sizeof(byte)) < 0 ||
-		    bpf_skb_store_bytes(skb, ip_offset + i, &byte, sizeof(byte), 0) < 0)
+		if (bpf_skb_load_bytes(skb, ip_offset + sizeof(option) + i, &byte,
+				       sizeof(byte)) < 0 ||
+		    bpf_skb_store_bytes(skb, ip_offset + i, &byte, sizeof(byte),
+					0) < 0)
 			return TC_ACT_OK;
 	}
-	for (int i = 0; i < 60; i++) {
+	for (i = 0; i < 60; i++) {
 		__u8 byte;
+
 		if (i >= tcp_len)
 			break;
-		if (bpf_skb_load_bytes(skb, tcp_offset + sizeof(option) + i,
-					       &byte, sizeof(byte)) < 0 ||
-		    bpf_skb_store_bytes(skb, tcp_offset + i, &byte, sizeof(byte), 0) < 0)
+		if (bpf_skb_load_bytes(skb, tcp_offset + sizeof(option) + i, &byte,
+				       sizeof(byte)) < 0 ||
+		    bpf_skb_store_bytes(skb, tcp_offset + i, &byte, sizeof(byte),
+					0) < 0)
 			return TC_ACT_OK;
 	}
 
 	new_total = old_total + BPF_HTONS(sizeof(option));
-	new_doff_flags = (old_doff_flags & BPF_HTONS(0x0fff)) |
-			 BPF_HTONS(3 << 12);
+	/* +12 option bytes => data offset increases by 3 (32-bit words). */
+	new_doff_flags = old_doff_flags + BPF_HTONS(3 << 12);
 	if (bpf_l3_csum_replace(skb, ip_offset + offsetof(struct iphdr, check),
 				old_total, new_total, sizeof(old_total)) < 0 ||
 	    bpf_l4_csum_replace(skb, tcp_offset + 12, old_doff_flags,
@@ -234,17 +228,19 @@ int rst_guard_client_egress(struct __sk_buff *skb)
 	if (bpf_skb_store_bytes(skb, ip_offset + offsetof(struct iphdr, tot_len),
 				&new_total, sizeof(new_total), 0) < 0 ||
 	    bpf_skb_store_bytes(skb, tcp_offset + 12, &new_doff_flags,
-				 sizeof(new_doff_flags), 0) < 0)
+				sizeof(new_doff_flags), 0) < 0)
 		return TC_ACT_OK;
-	for (int i = 0; i < sizeof(option) / sizeof(__u16); i++) {
+	for (i = 0; i < (int)(sizeof(option) / sizeof(__u16)); i++) {
 		__u16 word = BPF_HTONS(((__u16)option[i * 2] << 8) |
-					option[i * 2 + 1]);
-		if (bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
+				       option[i * 2 + 1]);
+
+		if (bpf_l4_csum_replace(skb,
+					tcp_offset + offsetof(struct tcphdr, check),
 					0, word, sizeof(word)) < 0)
 			return TC_ACT_OK;
 	}
-	if (bpf_skb_store_bytes(skb, tcp_offset + tcp_len, option,
-				 sizeof(option), 0) < 0)
+	if (bpf_skb_store_bytes(skb, tcp_offset + tcp_len, option, sizeof(option),
+				0) < 0)
 		return TC_ACT_OK;
 	return TC_ACT_OK;
 }
