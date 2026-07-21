@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# rst-guardd: keep SSH RST Guard TC filters attached on target interfaces.
+set -euo pipefail
+
+PREFIX="${RST_GUARD_PREFIX:-/opt/rst-guard}"
+OBJ="${RST_GUARD_OBJ:-$PREFIX/rst_guard.bpf.o}"
+CONF="${RST_GUARD_CONF:-/etc/rst-guard/config}"
+INTERVAL="${RST_GUARD_INTERVAL:-5}"
+LOG_TAG="rst-guardd"
+
+log() {
+	local msg="$*"
+	if command -v logger >/dev/null 2>&1; then
+		logger -t "$LOG_TAG" -- "$msg" || true
+	fi
+	printf '%s %s\n' "$(date -Is 2>/dev/null || date)" "$msg" >&2
+}
+
+die() {
+	log "ERROR: $*"
+	exit 1
+}
+
+load_config() {
+	# shellcheck disable=SC1090
+	if [[ -f "$CONF" ]]; then
+		# shellcheck source=/dev/null
+		source "$CONF"
+	fi
+	INTERVAL="${INTERVAL:-5}"
+	# IFACES empty => auto-detect all non-loopback, UP (or all non-lo) ifaces
+	IFACES="${IFACES:-}"
+	MODE="${MODE:-both}" # both | ingress | egress
+}
+
+list_candidate_ifaces() {
+	local iface
+	if [[ -n "${IFACES// /}" ]]; then
+		# shellcheck disable=SC2086
+		for iface in $IFACES; do
+			[[ -n "$iface" ]] || continue
+			printf '%s\n' "$iface"
+		done
+		return 0
+	fi
+
+	# Prefer kernel netdevs; skip loopback and known virtual junk if down-only.
+	if [[ -d /sys/class/net ]]; then
+		for iface in /sys/class/net/*; do
+			iface="${iface##*/}"
+			[[ "$iface" == "lo" ]] && continue
+			# Skip if interface disappeared mid-scan.
+			[[ -e "/sys/class/net/$iface" ]] || continue
+			printf '%s\n' "$iface"
+		done
+	else
+		ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | \
+			grep -vx lo || true
+	fi
+}
+
+iface_exists() {
+	[[ -e "/sys/class/net/$1" ]]
+}
+
+has_clsact() {
+	tc qdisc show dev "$1" 2>/dev/null | grep -q 'clsact'
+}
+
+filter_present() {
+	# $1=iface $2=direction $3=section name fragment
+	local iface="$1" dir="$2" needle="$3"
+	tc filter show dev "$iface" "$dir" 2>/dev/null | grep -q "$needle"
+}
+
+ensure_clsact() {
+	local iface="$1"
+	if ! has_clsact "$iface"; then
+		tc qdisc replace dev "$iface" clsact
+		log "qdisc clsact installed on $iface"
+	fi
+}
+
+attach_ingress() {
+	local iface="$1"
+	if filter_present "$iface" ingress 'rst_guard.bpf.o:\[classifier\]' ||
+	   filter_present "$iface" ingress 'name rst_guard'; then
+		return 0
+	fi
+	tc filter replace dev "$iface" ingress bpf da obj "$OBJ" sec classifier
+	log "attached ingress classifier on $iface"
+}
+
+attach_egress() {
+	local iface="$1"
+	if filter_present "$iface" egress 'rst_guard.bpf.o:\[classifier/egress\]' ||
+	   filter_present "$iface" egress 'name rst_guard_clien'; then
+		return 0
+	fi
+	tc filter replace dev "$iface" egress bpf da obj "$OBJ" sec classifier/egress
+	log "attached egress classifier/egress on $iface"
+}
+
+patch_iface() {
+	local iface="$1"
+	if ! iface_exists "$iface"; then
+		return 0
+	fi
+	ensure_clsact "$iface"
+	case "$MODE" in
+	ingress)
+		attach_ingress "$iface"
+		;;
+	egress)
+		attach_egress "$iface"
+		;;
+	both|*)
+		attach_ingress "$iface"
+		attach_egress "$iface"
+		;;
+	esac
+}
+
+detach_iface() {
+	local iface="$1"
+	iface_exists "$iface" || return 0
+	tc filter del dev "$iface" ingress 2>/dev/null || true
+	tc filter del dev "$iface" egress 2>/dev/null || true
+	tc qdisc del dev "$iface" clsact 2>/dev/null || true
+	log "detached filters on $iface"
+}
+
+scan_once() {
+	local iface
+	local count=0
+	while IFS= read -r iface; do
+		[[ -z "$iface" ]] && continue
+		if patch_iface "$iface"; then
+			count=$((count + 1))
+		else
+			log "WARN: failed to patch $iface"
+		fi
+	done < <(list_candidate_ifaces)
+	if [[ "$count" -eq 0 ]]; then
+		log "WARN: no interfaces patched this cycle"
+	fi
+}
+
+require_root() {
+	if [[ "$(id -u)" -ne 0 ]]; then
+		die "must run as root"
+	fi
+}
+
+require_tools() {
+	command -v tc >/dev/null 2>&1 || die "tc (iproute2) not found"
+	command -v ip >/dev/null 2>&1 || die "ip (iproute2) not found"
+	[[ -f "$OBJ" ]] || die "missing BPF object: $OBJ (run install/build first)"
+}
+
+cleanup() {
+	log "stopping"
+	exit 0
+}
+
+main() {
+	require_root
+	load_config
+	require_tools
+	trap cleanup TERM INT
+
+	log "start prefix=$PREFIX obj=$OBJ conf=$CONF interval=${INTERVAL}s mode=$MODE ifaces=${IFACES:-auto}"
+
+	# Immediate pass so filters are up before first sleep.
+	scan_once || true
+
+	while true; do
+		sleep "$INTERVAL" || true
+		load_config
+		scan_once || true
+	done
+}
+
+# CLI helpers for install/uninstall scripts
+case "${1:-daemon}" in
+daemon)
+	main
+	;;
+once)
+	require_root
+	load_config
+	require_tools
+	scan_once
+	;;
+status)
+	load_config
+	echo "obj=$OBJ conf=$CONF mode=$MODE interval=$INTERVAL"
+	echo "ifaces=${IFACES:-auto}"
+	echo "--- candidates ---"
+	list_candidate_ifaces
+	echo "--- filters ---"
+	while IFS= read -r iface; do
+		[[ -z "$iface" ]] && continue
+		echo "[$iface]"
+		tc filter show dev "$iface" ingress 2>/dev/null || true
+		tc filter show dev "$iface" egress 2>/dev/null || true
+	done < <(list_candidate_ifaces)
+	;;
+detach-all)
+	require_root
+	load_config
+	while IFS= read -r iface; do
+		[[ -z "$iface" ]] && continue
+		detach_iface "$iface"
+	done < <(list_candidate_ifaces)
+	;;
+*)
+	echo "usage: $0 {daemon|once|status|detach-all}" >&2
+	exit 2
+	;;
+esac

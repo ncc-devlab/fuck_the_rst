@@ -1,0 +1,12 @@
+# /etc/rst-guard/config
+# Space-separated interface list. Empty = auto-detect all non-lo interfaces.
+IFACES=""
+
+# both | ingress | egress
+# - both: drop forged SSH RSTs (ingress) + stamp local SSH RSTs (egress)
+# - ingress: server-only drop
+# - egress: client-only stamp
+MODE="both"
+
+# Rescan / re-attach interval in seconds
+INTERVAL=5

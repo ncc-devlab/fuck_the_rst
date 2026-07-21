@@ -1,0 +1,20 @@
+[Unit]
+Description=SSH RST Guard (TC eBPF attach daemon)
+Documentation=file:///opt/rst-guard/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=RST_GUARD_PREFIX=/opt/rst-guard
+Environment=RST_GUARD_OBJ=/opt/rst-guard/rst_guard.bpf.o
+Environment=RST_GUARD_CONF=/etc/rst-guard/config
+ExecStart=/opt/rst-guard/rst-guardd daemon
+Restart=on-failure
+RestartSec=3
+# Needs CAP_NET_ADMIN + CAP_SYS_ADMIN / CAP_BPF depending on kernel; root is simplest.
+User=root
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
